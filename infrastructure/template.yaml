@@ -1,0 +1,428 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Rural Healthcare Content Assistant - AWS Serverless Backend
+  Processes doctor inputs (voice/image) and generates multilingual
+  patient-friendly healthcare instructions.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+    Environment:
+      Variables:
+        CONSULTATIONS_TABLE: !Ref ConsultationsTable
+        UPLOADS_BUCKET: !Ref UploadsBucket
+        AUDIO_BUCKET: !Ref AudioBucket
+        BEDROCK_MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+        BEDROCK_REGION: us-east-1
+        AWS_REGION_OVERRIDE: ap-south-1
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  WhatsAppApiUrl:
+    Type: String
+    Default: ''
+  WhatsAppApiToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+  SmsGatewayUrl:
+    Type: String
+    Default: ''
+  SmsApiKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+
+Resources:
+
+  # ==================== DynamoDB ====================
+
+  ConsultationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Consultations-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: consultation_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: doctor_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: consultation_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: doctor_id-index
+          KeySchema:
+            - AttributeName: doctor_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ==================== S3 Buckets ====================
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'healthcare-uploads-${Stage}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTempFiles
+            Status: Enabled
+            ExpirationInDays: 30
+            Prefix: inputs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'healthcare-audio-${Stage}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAudio
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ==================== IAM Role ====================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'HealthcareLambdaRole-${Stage}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ConsultationsTable.Arn
+                  - !Sub '${ConsultationsTable.Arn}/index/*'
+
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${UploadsBucket.Arn}/*'
+                  - !Sub '${AudioBucket.Arn}/*'
+
+        - PolicyName: TextractAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:AnalyzeDocument
+                Resource: '*'
+
+        - PolicyName: TranscribeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                Resource: '*'
+
+        - PolicyName: PollyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                Resource: '*'
+
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Healthcare*'
+
+  # ==================== API Gateway ====================
+
+  HealthcareApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'HealthcareAPI-${Stage}'
+      StageName: !Ref Stage
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # ==================== Lambda Functions ====================
+
+  ProcessInputFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareProcessInput-${Stage}'
+      CodeUri: ../lambda/process_input/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          VOICE_TO_TEXT_FUNCTION: !Ref VoiceToTextFunction
+          IMAGE_TO_TEXT_FUNCTION: !Ref ImageToTextFunction
+      Events:
+        PostConsultation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthcareApi
+            Path: /consultations
+            Method: POST
+
+  VoiceToTextFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareVoiceToText-${Stage}'
+      CodeUri: ../lambda/voice_to_text/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          EXTRACT_MEDICAL_INFO_FUNCTION: !Ref ExtractMedicalInfoFunction
+
+  ImageToTextFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareImageToText-${Stage}'
+      CodeUri: ../lambda/image_to_text/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          EXTRACT_MEDICAL_INFO_FUNCTION: !Ref ExtractMedicalInfoFunction
+
+  ExtractMedicalInfoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareExtractMedicalInfo-${Stage}'
+      CodeUri: ../lambda/extract_medical_info/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          GENERATE_CONTENT_FUNCTION: !Ref GenerateContentFunction
+
+  GenerateContentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareGenerateContent-${Stage}'
+      CodeUri: ../lambda/generate_content/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          GENERATE_AUDIO_FUNCTION: !Ref GenerateAudioFunction
+
+  GenerateAudioFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareGenerateAudio-${Stage}'
+      CodeUri: ../lambda/generate_audio/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  DoctorReviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareDoctorReview-${Stage}'
+      CodeUri: ../lambda/doctor_review/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          DELIVER_CONTENT_FUNCTION: !Ref DeliverContentFunction
+      Events:
+        GetReview:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthcareApi
+            Path: /consultations/{id}/review
+            Method: GET
+        UpdateReview:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthcareApi
+            Path: /consultations/{id}/review
+            Method: PUT
+        ApproveConsultation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthcareApi
+            Path: /consultations/{id}/approve
+            Method: POST
+
+  DeliverContentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareDeliverContent-${Stage}'
+      CodeUri: ../lambda/deliver_content/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          WHATSAPP_API_URL: !Ref WhatsAppApiUrl
+          WHATSAPP_API_TOKEN: !Ref WhatsAppApiToken
+          SMS_GATEWAY_URL: !Ref SmsGatewayUrl
+          SMS_API_KEY: !Ref SmsApiKey
+
+  ConsultationStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HealthcareConsultationStatus-${Stage}'
+      CodeUri: ../lambda/consultation_status/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      Events:
+        GetConsultation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthcareApi
+            Path: /consultations/{id}
+            Method: GET
+        ListConsultations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthcareApi
+            Path: /consultations
+            Method: GET
+
+  # ==================== CloudWatch Alarms ====================
+
+  ProcessingErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Healthcare-ProcessingErrors-${Stage}'
+      AlarmDescription: Alert when Lambda processing errors exceed threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ExtractMedicalInfoFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Healthcare-HighLatency-${Stage}'
+      AlarmDescription: Alert when processing takes longer than 60 seconds
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessInputFunction
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${HealthcareApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+  ConsultationsTableName:
+    Description: DynamoDB table name
+    Value: !Ref ConsultationsTable
+  UploadsBucketName:
+    Description: S3 uploads bucket
+    Value: !Ref UploadsBucket
+  AudioBucketName:
+    Description: S3 audio bucket
+    Value: !Ref AudioBucket

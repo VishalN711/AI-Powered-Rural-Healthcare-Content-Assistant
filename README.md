@@ -1,10 +1,150 @@
-# AI-Powered-Rural-Healthcare-Content-Assistant
-India’s rural population (~65% of citizens) faces major healthcare communication barriers. Patients often cannot fully understand doctors’ instructions, which are typically given in English or as handwritten notes. We propose an AI assistant that converts a doctor’s consultation into clear patient-facing content.
-For example, a doctor’s voice note or a photo of a prescription can be turned into a concise WhatsApp/SMS summary and audio explanation in the patient’s native language. (Tools like ASHABot already take voice queries on WhatsApp and respond in Hindi, and EasyClinic’s platform sends multilingual e-prescriptions and care instructions via WhatsApp/SMS.) This system would generate the output in under 60 seconds, delivering WhatsApp-ready summaries (in Hindi or regional tongues) and audio reminders.
+# Rural Healthcare Content Assistant
 
-Input: A doctor’s voice recording or an image of the written prescription/notes. (For example, the physician speaks into a smartphone app: “Take 1 tablet of Drug X twice a day with meals.”)
+🏥 **AI-Powered Multilingual Medical Instructions for Rural India**
 
-Output: A patient-friendly package: a text message summarizing the treatment plan in Hindi (or local dialect), a bullet-list dosage chart, and a short audio clip (or illustrated image) explaining key steps. The output can be automatically sent over WhatsApp or SMS, mirroring telemedicine tools that deliver “e-prescriptions” and guidance in regional languages.
+A serverless AWS-native system that processes doctor inputs (voice recordings & prescription images) and generates patient-friendly, multilingual healthcare instructions delivered via WhatsApp or SMS within 60 seconds.
 
-Impact: This bridges the doctor–patient communication gap. By delivering the prescription and advice in the patient’s own language, it improves understanding and adherence. For example, instead of indecipherable notes, a patient would receive a clear WhatsApp message and voice reminder about their medication. This aligns with Digital India’s goal of inclusive services: EasyClinic notes that multilingual digital prescriptions (via SMS/WhatsApp) boost patient engagement, and addressing India’s 22+ regional languages is crucial for effective care. In practice, this low-cost AI tool empowers rural clinics to give every patient personalized, understandable instructions, reducing errors and improving health outcomes.
+## Problem
 
+65% of India's rural population struggles to understand medical instructions provided in English or handwritten form. This system bridges that communication gap by:
+
+- Converting voice recordings → text (Amazon Transcribe)
+- Converting prescription images → text (Amazon Textract)
+- Extracting medications, dosages & precautions (Amazon Bedrock / Claude 3 Sonnet)
+- Generating patient-friendly content in 6+ Indian languages (Bedrock)
+- Creating audio instructions (Amazon Polly)
+- Delivering via WhatsApp / SMS
+
+## Architecture
+
+```
+Doctor Input (Voice/Image)
+        │
+        ▼
+  ┌─────────────┐     ┌──────────────┐
+  │ API Gateway  │────▶│ Process Input │ (Lambda - Orchestrator)
+  └─────────────┘     └──────┬───────┘
+                             │
+                  ┌──────────┴──────────┐
+                  ▼                     ▼
+          ┌──────────────┐    ┌──────────────┐
+          │ Voice→Text   │    │ Image→Text   │
+          │ (Transcribe) │    │ (Textract)   │
+          └──────┬───────┘    └──────┬───────┘
+                 └──────────┬────────┘
+                            ▼
+                  ┌──────────────────┐
+                  │ Extract Medical  │ (Bedrock Claude 3)
+                  │ Information      │
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Generate Content │ (Bedrock Claude 3)
+                  │ (Multilingual)   │
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Generate Audio   │ (Amazon Polly)
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Doctor Review    │ ← Doctor approves/edits
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Deliver Content  │ → WhatsApp / SMS
+                  └──────────────────┘
+```
+
+## AWS Services Used
+
+| Service | Purpose |
+|---------|---------|
+| **API Gateway** | REST API exposure |
+| **Lambda** (Python 3.12) | All backend processing (9 functions) |
+| **DynamoDB** | Consultation records storage |
+| **S3** | Prescription images & generated audio |
+| **Bedrock** (Claude 3 Sonnet) | Medical extraction & multilingual generation |
+| **Textract** | OCR for prescription images |
+| **Transcribe** | Speech-to-text for voice recordings |
+| **Polly** | Text-to-speech audio generation |
+| **IAM** | Least-privilege access control |
+| **CloudWatch** | Monitoring, logging & alarms |
+
+## Supported Languages
+
+🇮🇳 Hindi (हिन्दी) · Tamil (தமிழ்) · Telugu (తెలుగు) · Bengali (বাংলা) · Marathi (मराठी) · Gujarati (ગુજરાતી)
+
+## Project Structure
+
+```
+├── infrastructure/          # AWS SAM/CloudFormation
+│   ├── template.yaml        # All AWS resources
+│   └── samconfig.toml       # Deployment config
+├── lambda/                  # Lambda functions (Python)
+│   ├── process_input/       # Orchestrator
+│   ├── voice_to_text/       # Amazon Transcribe
+│   ├── image_to_text/       # Amazon Textract
+│   ├── extract_medical_info/# Bedrock NLP extraction
+│   ├── generate_content/    # Bedrock multilingual generation
+│   ├── generate_audio/      # Amazon Polly TTS
+│   ├── doctor_review/       # Review workflow
+│   ├── deliver_content/     # WhatsApp/SMS delivery
+│   ├── consultation_status/ # Status queries
+│   └── shared/              # Shared utilities
+├── frontend/                # React + Vite dashboard
+│   └── src/
+│       ├── api/             # API Gateway client
+│       ├── components/      # Reusable UI components
+│       └── pages/           # Page views
+├── design.md                # System architecture
+└── requirements.md          # Requirements document
+```
+
+## Quick Start
+
+### Frontend (Development)
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### Backend (AWS Deployment)
+```bash
+# Prerequisites: AWS CLI, SAM CLI configured
+cd infrastructure
+sam build
+sam deploy --guided
+```
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/consultations` | Submit new consultation |
+| `GET` | `/consultations/{id}` | Get consultation details |
+| `GET` | `/consultations?doctor_id=` | List by doctor |
+| `GET` | `/consultations/{id}/review` | Get for review |
+| `PUT` | `/consultations/{id}/review` | Update content |
+| `POST` | `/consultations/{id}/approve` | Approve & deliver |
+
+## Output Format (JSON)
+
+```json
+{
+  "consultation_id": "uuid",
+  "original_text": "...",
+  "extracted_medications": [...],
+  "dosage_schedule": { "morning": [], "afternoon": [], "evening": [], "night": [] },
+  "precautions": [...],
+  "translated_summary": "...",
+  "audio_file_s3_url": "...",
+  "language_used": "hindi",
+  "timestamp": "ISO-8601"
+}
+```
+
+## License
+
+MIT
